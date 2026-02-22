@@ -14,8 +14,9 @@ BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-# Reuse the same regex used by the CLI/runtime → one source of truth
+# Reuse the same regex used by the CLI/runtime → single source of truth
 from lakehouse_fm_agent.runtime.lineage import EDGE_RE, SKIP_RE  # type: ignore
+
 
 # ------------------------------------------------------------------------------------
 # Branding / page config
@@ -23,17 +24,17 @@ from lakehouse_fm_agent.runtime.lineage import EDGE_RE, SKIP_RE  # type: ignore
 st.set_page_config(page_title="SAP FM Analyzer & Converter", layout="wide")
 st.title("SAP FM Analyzer & Converter — Preview")
 
+
 # ------------------------------------------------------------------------------------
 # Helpers (parsing, classification, analytics)
 # ------------------------------------------------------------------------------------
 STD_PREFIXES = ("R", "RS", "RR", "DD", "ENQUEUE", "DEQUEUE", "TR", "S", "CL_", "SAP")
 
 def is_custom(fm: str) -> bool:
-    # Treat Y*, Z*, and namespaces like /OSP/*, /BIC/* as custom
     if not isinstance(fm, str):
         return False
     u = fm.upper().strip()
-    return u.startswith(("Y", "Z", "/"))
+    return u.startswith(("Y", "Z", "/"))  # Y*, Z*, or namespaces (/OSP/*, /BIC/*)
 
 def is_standard(fm: str) -> bool:
     u = fm.upper().strip()
@@ -49,7 +50,9 @@ def category_for_fm(name: str) -> str:
         return "UoM_Currency"
     if ("READ_0MATERIAL" in n) or ("READ_PRODFORM" in n) or ("READ_CUSTSALES" in n) or ("READ_ECLASS" in n) or ("READ_MASTER_DATA" in n):
         return "Masterdata_Readers"
-    if ("DATE" in n) or ("MONTH" in n) or ("WEEK" in n) or ("PERIOD" in n) or n in {"SN_LAST_DAY_OF_MONTH","SLS_MISC_GET_LAST_DAY_OF_MONTH","/OSP/GET_DAYS_IN_MONTH","Y_PCM_LAST_DAY_OF_MONTH"}:
+    if ("DATE" in n) or ("MONTH" in n) or ("WEEK" in n) or ("PERIOD" in n) or n in {
+        "SN_LAST_DAY_OF_MONTH","SLS_MISC_GET_LAST_DAY_OF_MONTH","/OSP/GET_DAYS_IN_MONTH","Y_PCM_LAST_DAY_OF_MONTH"
+    }:
         return "Calendar_Time"
     if ("CONVERSION_EXIT_ALPHA" in n) or ("NUMERIC_CHECK" in n) or ("CHAVL_CHECK" in n) or ("REPLACE_STRANGE_CHARS" in n):
         return "Data_Cleansing_Validation"
@@ -61,10 +64,61 @@ def category_for_fm(name: str) -> str:
         return "BW_SID_Texts"
     return "Domain_Logic_Other"
 
+# Workaround/pattern pointers (show in the summary for standard FMs)
+POINTERS = {
+    "BW_Platform_API":
+        "- Replace BW mechanics with Lakehouse patterns:\n"
+        "  - DSO writes → **Delta MERGE**\n"
+        "  - SID lookups → **joins by business keys**\n"
+        "  - DDIC/metadata → **control tables**",
+    "UoM_Currency":
+        "- Implement **table-driven** conversion (FX, currency decimals, UoM factors) + **Spark UDFs**",
+    "Masterdata_Readers":
+        "- Replace with **joins** to curated dimensions in Unity Catalog",
+    "Calendar_Time":
+        "- Use **Spark date functions** + enterprise **calendar** table",
+    "Data_Cleansing_Validation":
+        "- **Lightweight Spark SQL** expressions/UDFs (e.g., lpad, regex checks)",
+    "Hierarchy":
+        "- Maintain a **parent-child** table; resolve via recursive/self-joins",
+    "Payment_Terms":
+        "- Model as **table-driven rules**; compute via PySpark functions",
+    "BW_SID_Texts":
+        "- No 1:1; maintain **attributes/texts** in Delta + **MERGE**",
+    "Domain_Logic_Other":
+        "- Assess; rebuild as PySpark transforms with small reference tables"
+}
+
+def classify_action(fm: str):
+    """
+    Returns (action, rationale, category, is_custom_bool)
+      action ∈ {REBUILD, PATTERN, LIGHTWEIGHT, JOIN}
+    """
+    cat = category_for_fm(fm)
+    custom = is_custom(fm)
+    if custom:
+        if cat in {"UoM_Currency", "Masterdata_Readers", "Hierarchy", "Payment_Terms", "Domain_Logic_Other"}:
+            return ("REBUILD", POINTERS.get(cat, POINTERS["Domain_Logic_Other"]), cat, True)
+        if cat == "Data_Cleansing_Validation":
+            return ("LIGHTWEIGHT", POINTERS[cat], cat, True)
+        if cat == "Calendar_Time":
+            return ("LIGHTWEIGHT", POINTERS[cat], cat, True)
+        if cat in {"BW_Platform_API","BW_SID_Texts"}:
+            return ("PATTERN", POINTERS[cat], cat, True)
+        return ("REBUILD", POINTERS["Domain_Logic_Other"], cat, True)
+    else:
+        # Standard SAP/BW → Pattern/Lightweight/Join
+        if cat in {"BW_Platform_API","BW_SID_Texts"}:
+            return ("PATTERN", POINTERS[cat], cat, False)
+        if cat in {"UoM_Currency","Data_Cleansing_Validation","Calendar_Time"}:
+            return ("LIGHTWEIGHT", POINTERS[cat], cat, False)
+        if cat == "Masterdata_Readers":
+            return ("JOIN", POINTERS[cat], cat, False)
+        return ("PATTERN", POINTERS["Domain_Logic_Other"], cat, False)
+
 def parse_edges_text(text: str):
     """
-    Parse a LINEAGE.txt-like string into:
-      list of tuples (parent, child, kind, skipped)
+    Parse a LINEAGE.txt-like string into: list[(parent, child, kind, skipped)]
     """
     rows = []
     for raw in text.splitlines():
@@ -96,59 +150,87 @@ def summarize_edges(edges):
     return {"edges": len(edges), "nodes": len(nodes)}
 
 def deg_metrics(edges):
-    """
-    Return:
-      - in_deg: dict[fm] = count
-      - out_deg: dict[fm] = count
-      - nodes: set of all fm
-    """
     in_deg, out_deg, nodes = {}, {}, set()
     for p, c, k, s in edges:
         nodes.add(p); nodes.add(c)
         out_deg[p] = out_deg.get(p, 0) + 1
-        in_deg[c] = in_deg.get(c, 0) + 1
+        in_deg[c]  = in_deg.get(c, 0) + 1
         in_deg.setdefault(p, in_deg.get(p, 0))
         out_deg.setdefault(c, out_deg.get(c, 0))
     return in_deg, out_deg, nodes
 
-def criticality_score(fm, in_deg, out_deg):
-    # simple, interpretable: emphasize shared utilities (fan-in), then fan-out; custom +1
-    score = in_deg.get(fm,0) * 2 + out_deg.get(fm,0)
-    if is_custom(fm):
-        score += 1
-    return score
-
-def bfs_subgraph(edges, root_fm, depth=2, direction="out"):
-    """
-    Build a subgraph (edge list) around a root FM, up to 'depth'.
-    direction: "out" = root -> children; "in" = parents -> root; "both" = both ways
-    """
+def bfs_collect(edges, root, mode="out", max_depth=5):
+    """Return set of nodes reachable from root up to depth (excluding root)."""
     adj_out, adj_in = {}, {}
     for p,c,k,s in edges:
         adj_out.setdefault(p, set()).add(c)
         adj_in.setdefault(c, set()).add(p)
 
-    frontier = {root_fm}
-    seen = {root_fm}
-    out_edges = []
-
-    for _ in range(depth):
-        next_frontier = set()
+    frontier, seen = {root}, {root}
+    out_nodes = set()
+    for _ in range(max_depth):
+        nxt = set()
         for fm in frontier:
-            if direction in ("out","both"):
+            if mode in ("out","both"):
                 for ch in adj_out.get(fm, set()):
-                    out_edges.append((fm, ch, "FM", False))
                     if ch not in seen:
-                        seen.add(ch); next_frontier.add(ch)
-            if direction in ("in","both"):
+                        seen.add(ch); nxt.add(ch); out_nodes.add(ch)
+            if mode in ("in","both"):
                 for pa in adj_in.get(fm, set()):
-                    out_edges.append((pa, fm, "FM", False))
                     if pa not in seen:
-                        seen.add(pa); next_frontier.add(pa)
-        frontier = next_frontier
+                        seen.add(pa); nxt.add(pa); out_nodes.add(pa)
+        frontier = nxt
         if not frontier:
             break
-    return out_edges
+    return out_nodes
+
+def fm_summary(focus_fm, edges, in_deg, out_deg, nested_depth=3):
+    """
+    Build a rich summary for a single FM:
+      - direct children
+      - nested callees (up to nested_depth)
+      - inbound callers
+      - actions (REBUILD, PATTERN, LIGHTWEIGHT, JOIN) with rationale
+      - 'create list': custom FMs (direct + nested) that must be implemented
+      - 'pattern list': standard FMs we handle via patterns
+    """
+    # Direct children
+    direct = []
+    for p,c,k,s in edges:
+        if p == focus_fm and not s:
+            act, why, cat, is_c = classify_action(c)
+            direct.append((c, cat, "Y" if is_c else "N", act, why))
+
+    # Nested callees
+    nested_nodes = bfs_collect(edges, focus_fm, mode="out", max_depth=nested_depth)
+    nested = []
+    for n in sorted(nested_nodes):
+        if n == focus_fm:
+            continue
+        act, why, cat, is_c = classify_action(n)
+        nested.append((n, cat, "Y" if is_c else "N", act, why))
+
+    # Inbound callers (parents)
+    parents = sorted({p for p,c,k,s in edges if c == focus_fm})
+
+    # Build 'create' vs 'pattern' suggestion lists
+    create_list = sorted({name for (name, cat, y, act, why) in (direct + nested) if act == "REBUILD"})
+    pattern_list = sorted({name for (name, cat, y, act, why) in (direct + nested) if act in {"PATTERN","LIGHTWEIGHT","JOIN"}})
+
+    metrics = {
+        "in_degree": in_deg.get(focus_fm, 0),
+        "out_degree": out_deg.get(focus_fm, 0),
+        "criticality": (in_deg.get(focus_fm,0) * 2 + out_deg.get(focus_fm,0) + (1 if is_custom(focus_fm) else 0))
+    }
+
+    return {
+        "direct": direct,
+        "nested": nested,
+        "parents": parents,
+        "create_list": create_list,
+        "pattern_list": pattern_list,
+        "metrics": metrics
+    }
 
 def to_csv(rows, header):
     buf = io.StringIO()
@@ -157,6 +239,7 @@ def to_csv(rows, header):
         buf.write(",".join([str(x) for x in r]) + "\n")
     buf.seek(0)
     return buf.getvalue()
+
 
 # ------------------------------------------------------------------------------------
 # Upload + parsing: accept both ZIP (many runs) and TXT (single run)
@@ -169,7 +252,7 @@ uploaded = st.file_uploader(
 if not uploaded:
     st.info(
         "Upload a **.zip** containing multiple FM runs (each with `LINEAGE.txt`) "
-        "or a single **LINEAGE.txt** to see analytics, subgraph, and docs."
+        "or a single **LINEAGE.txt** to see analytics, summaries, and build lists."
     )
     st.stop()
 
@@ -186,6 +269,7 @@ if uploaded.name.lower().endswith(".zip"):
             text = z.read(member).decode("utf-8", errors="ignore")
         except Exception:
             text = z.read(member).decode("latin-1", errors="ignore")
+        # Use the first path segment as run key (N4MSALES/LINEAGE.txt → N4MSALES)
         parts = [p for p in member.split("/") if p]
         run_key = parts[0] if parts else member
         edges = parse_edges_text(text)
@@ -209,157 +293,155 @@ for v in runs.values():
 # Sidebar controls
 # ------------------------------------------------------------------------------------
 view_choice = st.sidebar.selectbox("Select run to visualize", ["Combined"] + list(runs.keys()))
-if view_choice == "Combined":
-    edges_view = combined
-else:
-    edges_view = runs[view_choice]
+edges_view = combined if view_choice == "Combined" else runs[view_choice]
 
-# Search/focus controls
-st.sidebar.markdown("**Focus FM (subgraph)**")
-all_nodes = sorted({x for e in edges_view for x in (e[0], e[1])})
+# Build degree metrics once
+in_deg, out_deg, nodes = deg_metrics(edges_view)
+all_nodes = sorted(nodes)
+
+st.sidebar.markdown("**Focus FM (summary & subgraph)**")
 focus_fm = st.sidebar.selectbox("FM", options=["<none>"] + all_nodes, index=0)
-depth = st.sidebar.slider("Depth", min_value=1, max_value=5, value=2)
-direction = st.sidebar.selectbox("Direction", options=["out","in","both"], index=0)
+depth = st.sidebar.slider("Nested depth (calls)", min_value=1, max_value=8, value=3)
+
 
 # ------------------------------------------------------------------------------------
-# Top-level summary + analytics
+# Top-level summary + analytics per view
 # ------------------------------------------------------------------------------------
 stats = summarize_edges(edges_view)
 st.write(f"**Runs parsed:** {len(runs)}  |  **Nodes:** {stats['nodes']}  |  **Edges:** {stats['edges']}")
 
-# Build node attributes for analytics
-in_deg, out_deg, nodes = deg_metrics(edges_view)
+# Build overall create list (custom FMs across the current view)
+overall_create = sorted({fm for fm in nodes if is_custom(fm)})
 
-rows_summary = []
-cat_counts = {}
-cust_cnt = std_cnt = 0
-for n in nodes:
-    cat = category_for_fm(n)
-    cat_counts[cat] = cat_counts.get(cat, 0) + 1
-    if is_custom(n): cust_cnt += 1
-    elif is_standard(n): std_cnt += 1
-    rows_summary.append((
-        n,
-        in_deg.get(n,0),
-        out_deg.get(n,0),
-        "Y" if is_custom(n) else "N",
-        cat,
-        criticality_score(n, in_deg, out_deg)
-    ))
+st.subheader("Overall build list (custom FMs to implement as handlers)")
+st.write(f"Total custom FMs: **{len(overall_create)}**")
+st.dataframe(overall_create, use_container_width=True)
+st.download_button(
+    "Download overall build list (TXT)",
+    data="\n".join(overall_create),
+    file_name=f"{view_choice}_build_list.txt",
+    mime="text/plain"
+)
 
-# Sort by criticality
-rows_summary.sort(key=lambda r: r[-1], reverse=True)
-
-# Show top 20 critical FMs
-st.subheader("Top 20 critical FMs (by fan-in/out + custom bonus)")
-st.dataframe(rows_summary[:20], use_container_width=True, hide_index=True)
-
-# Category & custom/standard counts
-with st.expander("Category distribution & custom/standard split"):
-    st.write("**Custom (Y/Z/namespace)**:", cust_cnt, " | **Standard (SAP/BW)**:", std_cnt)
-    # Render a small table for categories
-    st.table(sorted([(k,v) for k,v in cat_counts.items()], key=lambda x: x[1], reverse=True))
 
 # ------------------------------------------------------------------------------------
-# Subgraph around a focused FM
+# Per‑FM summary (what it calls, what to convert vs. pattern, workaround)
 # ------------------------------------------------------------------------------------
-st.subheader("Focused subgraph")
-if focus_fm != "<none>":
-    sub_edges = bfs_subgraph(edges_view, focus_fm, depth=depth, direction=direction)
-    if not sub_edges:
-        st.info("No neighbors found with current settings.")
-    else:
-        st.markdown(build_mermaid(sub_edges))
-        with st.expander("Subgraph edges table"):
-            st.dataframe(sub_edges, use_container_width=True, hide_index=True)
+st.subheader("Per‑FM summary (what it calls, recommendations, workarounds)")
+if focus_fm == "<none>":
+    st.info("Select a **Focus FM** on the left to generate its summary.")
 else:
-    st.info("Pick a **Focus FM** on the left to see a subgraph (with depth & direction).")
+    summary = fm_summary(focus_fm, edges_view, in_deg, out_deg, nested_depth=depth)
+
+    m = summary["metrics"]
+    st.markdown(
+        f"- **FM:** `{focus_fm}`  |  **in_degree:** {m['in_degree']}  |  **out_degree:** {m['out_degree']}  |  **criticality:** {m['criticality']}"
+    )
+
+    # Direct children table
+    with st.expander("Direct children (one hop)"):
+        st.dataframe(
+            summary["direct"],
+            use_container_width=True,
+            hide_index=True
+        )
+        st.download_button(
+            "Download (CSV)",
+            data=to_csv(summary["direct"], header=["child","category","is_custom","action","rationale"]),
+            file_name=f"{focus_fm}_direct_children.csv",
+            mime="text/csv"
+        )
+
+    # Nested callees table
+    with st.expander(f"Nested callees (≤ {depth} hops)"):
+        st.dataframe(
+            summary["nested"],
+            use_container_width=True,
+            hide_index=True
+        )
+        st.download_button(
+            "Download (CSV)",
+            data=to_csv(summary["nested"], header=["callee","category","is_custom","action","rationale"]),
+            file_name=f"{focus_fm}_nested_callees.csv",
+            mime="text/csv"
+        )
+
+    # Parents
+    with st.expander("Inbound callers (parents)"):
+        st.dataframe(summary["parents"], use_container_width=True)
+
+    # Create vs Pattern lists
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Create in Python (handlers)**")
+        st.dataframe(summary["create_list"], use_container_width=True)
+        st.download_button(
+            "Download create list (TXT)",
+            data="\n".join(summary["create_list"]),
+            file_name=f"{focus_fm}_create_list.txt",
+            mime="text/plain"
+        )
+    with c2:
+        st.markdown("**Replace via pattern / lightweight / join**")
+        st.dataframe(summary["pattern_list"], use_container_width=True)
+        st.download_button(
+            "Download pattern list (TXT)",
+            data="\n".join(summary["pattern_list"]),
+            file_name=f"{focus_fm}_pattern_list.txt",
+            mime="text/plain"
+        )
+
+    # Doc seed (one-click)
+    master_md = f"""# {focus_fm} — Master Doc
+
+## AS‑IS (inferred)
+- in_degree={m['in_degree']}, out_degree={m['out_degree']}, criticality={m['criticality']}
+- Parents (who call this FM): {", ".join(summary["parents"]) if summary["parents"] else "—"}
+
+## TO‑BE (Databricks)
+- Rebuild list (handlers): {", ".join(summary["create_list"]) if summary["create_list"] else "—"}
+- Patterns/lightweight/join: {", ".join(summary["pattern_list"]) if summary["pattern_list"] else "—"}
+
+## Rationale & Workarounds (by category)
+{os.linesep.join([f"- {k}: {v}" for k,v in POINTERS.items()])}
+"""
+    st.download_button(
+        "Download Master doc seed (MD)",
+        data=master_md,
+        file_name=f"{focus_fm}_MASTER.md",
+        mime="text/markdown"
+    )
+
 
 # ------------------------------------------------------------------------------------
-# Full edges table + downloads
+# Full edges table + downloads for the current view
 # ------------------------------------------------------------------------------------
-with st.expander("Preview edges table (full view selection)"):
+with st.expander("Edges table (current view)"):
     st.dataframe(edges_view, use_container_width=True, hide_index=True)
 
 left, right = st.columns(2)
 with left:
-    csv = to_csv(edges_view, header=["parent","child","kind","skipped"])
-    st.download_button("Download edges (CSV)", data=csv, file_name=f"{view_choice}_edges.csv", mime="text/csv")
+    st.download_button(
+        "Download edges (CSV)",
+        data=to_csv(edges_view, header=["parent","child","kind","skipped"]),
+        file_name=f"{view_choice}_edges.csv",
+        mime="text/csv"
+    )
 with right:
-    # Export the Top‑N list as CSV
-    top_csv = to_csv(rows_summary[:50], header=["fm","in_degree","out_degree","is_custom","category","criticality"])
-    st.download_button("Download Top‑50 critical (CSV)", data=top_csv, file_name=f"{view_choice}_top50.csv", mime="text/csv")
+    # Also export a 2‑column "FM,action" plan for the current view
+    action_rows = []
+    for n in sorted(nodes):
+        act, why, cat, is_c = classify_action(n)
+        action_rows.append((n, cat, act, "Y" if is_c else "N"))
+    st.download_button(
+        "Download action plan (CSV)",
+        data=to_csv(action_rows, header=["fm","category","action","is_custom"]),
+        file_name=f"{view_choice}_action_plan.csv",
+        mime="text/csv"
+    )
 
 # ------------------------------------------------------------------------------------
-# Doc seeds (Master / LLD / How-to-Test) for the focused FM
+# Lineage graph (mermaid) for the current view or focused subgraph
 # ------------------------------------------------------------------------------------
-st.subheader("Generate documentation seeds (focused FM)")
-
-if focus_fm == "<none>":
-    st.info("Select a **Focus FM** to generate doc seeds.")
-else:
-    # Compose doc stubs in Markdown
-    fm_cat = category_for_fm(focus_fm)
-    fm_is_cust = "Yes" if is_custom(focus_fm) else "No"
-    ptr = ""
-    if fm_cat == "BW_Platform_API":
-        ptr = (
-            "- **Pointer**: Replace BW mechanics with Lakehouse patterns:\n"
-            "  - DSO writes → **Delta MERGE**\n"
-            "  - SID lookups → **joins by business keys**\n"
-            "  - DDIC/metadata → control tables\n"
-        )
-
-    master_md = f"""# {focus_fm} — Master Doc
-
-## AS‑IS (inferred)
-- Category: **{fm_cat}** | Custom: **{fm_is_cust}**
-- Role in graph: in_degree={in_deg.get(focus_fm,0)}, out_degree={out_deg.get(focus_fm,0)}, criticality={criticality_score(focus_fm,in_deg,out_deg)}
-
-## Lineage (local view)
-Use the "Focused subgraph" above to visualize N‑hop context.
-
-## TO‑BE (Databricks)
-- Follow category guidance:
-  - UoM/Currency → **table‑driven** (FX, currency decimals, UoM factors) + Spark UDFs
-  - Masterdata readers → **joins** to curated dims in Unity Catalog
-  - Calendar/Date → Spark functions + enterprise calendar table
-  - Cleansing/Alpha → Spark SQL expressions/UDFs
-  - BW Platform → **no 1:1**; use **MERGE/joins/control tables**
-{ptr}
-"""
-
-    lld_md = f"""# {focus_fm} — Design LLD
-
-## Components
-- Handler module: `core/` or `bw_replace/` per category
-- Inputs/Outputs: define schemas (DECIMAL scales for currency/UoM)
-
-## Contracts
-- Tables: FX, currency_decimals, uom_factors, calendar, logsys_map (as applicable)
-- Config: rounding policy, scale
-
-## Pseudocode
-1) Read required reference tables
-2) Transform using Spark SQL/UDFs
-3) MERGE/WRITE results or return DataFrame
-
-## Error handling
-- Null/invalid checks, logging, metrics
-"""
-
-    test_md = f"""# {focus_fm} — How to Test
-
-## Unit tests
-- Golden cases for conversion/rounding (currency/UoM)
-- Cleansing/alpha behaviors
-
-## Integration tests
-- Replay a short path from lineage (parents/children around {focus_fm})
-- Validate outputs and row counts
-"""
-
-    c1, c2, c3 = st.columns(3)
-    c1.download_button("Download Master.md", master_md, file_name=f"{focus_fm}_MASTER.md")
-    c2.download_button("Download Design_LLD.md", lld_md, file_name=f"{focus_fm}_LLD.md")
-    c3.download_button("Download How_to_Test.md", test_md, file_name=f"{focus_fm}_TEST.md")
+st.subheader("Lineage graph (current view)")
+st.markdown(build_mermaid(edges_view))
