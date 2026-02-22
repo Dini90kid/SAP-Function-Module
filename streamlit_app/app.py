@@ -8,6 +8,39 @@ from zipfile import ZipFile
 import pandas as pd
 import streamlit as st
 
+# ---------------- Excel writer helper (auto-select engine) ----------------
+def workbook_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    """
+    Build an Excel workbook in-memory from dataframes.
+    Prefers XlsxWriter; falls back to openpyxl; otherwise shows a helpful message.
+    """
+    import io
+    bio = io.BytesIO()
+
+    # Prefer XlsxWriter (great for writing); fall back to openpyxl if not available
+    engine = None
+    try:
+        import xlsxwriter  # noqa: F401
+        engine = "xlsxwriter"
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            engine = "openpyxl"
+        except Exception:
+            st.error(
+                "Neither **XlsxWriter** nor **openpyxl** is available. "
+                "Add one of them to requirements.txt and redeploy."
+            )
+            return b""
+
+    with pd.ExcelWriter(bio, engine=engine) as xw:
+        for name, df in sheets.items():
+            # Excel sheet names are max 31 chars
+            df.to_excel(xw, sheet_name=name[:31], index=False)
+
+    bio.seek(0)
+    st.caption(f"Excel writer engine used: **{engine}**")
+    return bio.read()
 # ---------------------------------------------------------------------
 # Make repo root importable
 # ---------------------------------------------------------------------
