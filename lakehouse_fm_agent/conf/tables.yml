@@ -1,0 +1,12 @@
+
+catalog: uc_catalog
+schemas:
+  ref: ref
+  lib: lib
+  eng: eng
+tables:
+  fx_rates: ref.fx_rates
+  currency_decimals: ref.currency_decimals
+  uom_factors: ref.uom_factors
+  calendar: ref.calendar
+  logsys_map: ref.logsys_map
