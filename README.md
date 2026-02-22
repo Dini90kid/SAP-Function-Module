@@ -1,5 +1,5 @@
 
-# Lakehouse FM Agent (GitHub-ready repo)
+#SAP FM Analyzer & Converter (GitHub-ready repo)
 
 A minimal, robust starter that:
 - Parses ABAP extractor outputs (e.g., `LINEAGE.txt`).
