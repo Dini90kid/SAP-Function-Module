@@ -1,0 +1,27 @@
+# Pick an available Excel writer engine (xlsxwriter preferred)
+def workbook_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    import io
+    bio = io.BytesIO()
+
+    # Try xlsxwriter first (fast, great for writing); else fall back to openpyxl
+    engine = None
+    try:
+        import xlsxwriter  # noqa: F401
+        engine = "xlsxwriter"
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            engine = "openpyxl"
+        except Exception:
+            st.error("Neither XlsxWriter nor openpyxl is available. "
+                     "Add one of them to requirements.txt and redeploy.")
+            return b""
+
+    with pd.ExcelWriter(bio, engine=engine) as xw:
+        for name, df in sheets.items():
+            df.to_excel(xw, sheet_name=name[:31], index=False)
+
+    bio.seek(0)
+    # Optional: display which engine got used
+    st.caption(f"Excel writer engine used: **{engine}**")
+    return bio.read()
