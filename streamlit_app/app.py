@@ -21,12 +21,14 @@ if up is not None:
     st.success(f"Parsed edges: {len(edges)}")
     with st.expander("Preview edges"):
         st.dataframe(edges)
-    mmd = ["graph TD"]
-    for p,c,k,s in edges:
-        mmd.append(f'  "{p}" --> "{c}"')
-    st.markdown("```mermaid
-"+"
-".join(mmd)+"
-```")
+# Build Mermaid lines
+mmd = ["graph TD"] + [f'  "{p}" --> "{c}"' for p, c, k, s in edges]
+
+# Render Mermaid in Streamlit (triple-quoted string is required for multi-line literal)
+st.markdown(
+    f"""```mermaid
+{'\n'.join(mmd)}
+```"""
+)
 else:
     st.info("Upload LINEAGE.txt to preview edges and Mermaid graph.")
