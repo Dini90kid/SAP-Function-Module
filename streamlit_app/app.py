@@ -3,14 +3,15 @@ import io
 import os
 import sys
 from pathlib import Path
-from zipfile import ZipFile
-import zipfile
+from zipfile import ZipFile, ZIP_DEFLATED
+from datetime import datetime
+import textwrap
 
 import pandas as pd
 import streamlit as st
 
 # ---------------------------------------------------------------------
-# Ensure the repo root is importable so package imports work
+# Ensure repo root is importable
 # ---------------------------------------------------------------------
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
@@ -62,7 +63,7 @@ def workbook_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
 STD_PREFIXES = ("R", "RS", "RR", "DD", "ENQUEUE", "DEQUEUE", "TR", "S", "CL_", "SAP")
 
 def is_custom(fm: str) -> bool:
-    if not isinstance(fm, str):
+    if not isinstance(fm, str): 
         return False
     return fm.upper().strip().startswith(("Y", "Z", "/"))
 
@@ -86,7 +87,7 @@ POINTERS = {
     "BW_Platform_API": "Replace BW mechanics with Lakehouse patterns: DSO → Delta MERGE; SID → joins by business keys; DDIC → control tables",
     "UoM_Currency": "Table‑driven conversion (FX, currency decimals, UoM factors) + Spark UDFs",
     "Masterdata_Readers": "Join curated dimensions in Unity Catalog; no generic BW readers",
-    "Calendar_Time": "Spark date functions + enterprise calendar table",
+    "Calendar_Time": "Use Spark date functions + enterprise calendar table",
     "Data_Cleansing_Validation": "Use Spark SQL expressions/UDFs (lpad, regex) instead of exits",
     "Hierarchy": "Parent‑child table + recursive/self‑joins",
     "Payment_Terms": "Model rules in a table; compute with PySpark",
@@ -111,16 +112,18 @@ def parse_lineage_text(text: str):
     edges = []
     for raw in text.splitlines():
         line = raw.strip()
-        if not line:
+        if not line: 
             continue
         m_skip = SKIP_RE.search(line)
         if m_skip:
-            p = m_skip.group("p").strip(); c = m_skip.group("c").strip()
+            p = m_skip.group("p").strip()
+            c = m_skip.group("c").strip()
             edges.append((p, c))
             continue
         m = EDGE_RE.search(line.replace("  "," ").replace(" -","-"))
         if m:
-            p = m.group("p").strip(); c = m.group("c").strip()
+            p = m.group("p").strip()
+            c = m.group("c").strip()
             edges.append((p, c))
     # dedupe while keeping order
     seen, uniq = set(), []
@@ -133,7 +136,7 @@ def edges_from_csv(df: pd.DataFrame):
     cols = {c: str(c).strip().lower().replace(" ", "_") for c in df.columns}
     df = df.rename(columns=cols)
     for need in ["main_fm","subfm","level2","level_3","level_4"]:
-        if need not in df.columns:
+        if need not in df.columns: 
             df[need] = None
     edges = []
     for _, r in df.iterrows():
@@ -157,28 +160,223 @@ def degrees(edges):
         in_deg.setdefault(p, in_deg.get(p,0)); out_deg.setdefault(c, out_deg.get(c,0))
     return in_deg, out_deg, nodes
 
+# Subgraph, Mermaid, and doc-pack builders
+def bfs_nodes(adj, root, depth=3, direction="out"):
+    seen, frontier, out_nodes = {root}, {root}, set()
+    for _ in range(depth):
+        nxt = set()
+        for x in frontier:
+            if direction in ("out","both"):
+                for ch in adj.get(x, set()):
+                    if ch not in seen:
+                        seen.add(ch); nxt.add(ch); out_nodes.add(ch)
+            if direction in ("in","both"):
+                for pa, kids in adj.items():
+                    if x in kids and pa not in seen:
+                        seen.add(pa); nxt.add(pa); out_nodes.add(pa)
+        frontier = nxt
+        if not frontier: break
+    return out_nodes
+
+def build_mermaid_subgraph(adj, root, depth=3):
+    nodes = bfs_nodes(adj, root, depth=depth, direction="out")
+    edges = []
+    for p, kids in adj.items():
+        if p == root or p in nodes:
+            for c in kids:
+                if c in nodes or p == root:
+                    edges.append((p,c))
+    lines = ['graph TD'] + [f'  "{p}" --> "{c}"' for p,c in edges]
+    return "```mermaid\n" + "\n".join(lines) + "\n```"
+
+def make_handler_py(fm: str, category: str, prompt: str) -> str:
+    # Minimal but helpful skeleton; keep it lightweight and pattern-oriented
+    template = f'''# handler.py — generated {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+# FM: {fm}
+# Category: {category}
+# Prompt notes: {prompt.strip() or "—"}
+
+from lakehouse_fm_agent.runtime.context import Context
+from typing import Optional
+
+def handler(ctx: Optional[Context]) -> None:
+    """
+    PURPOSE (AS-IS):
+      - Implement logic formerly in FM {fm} in a Lakehouse-native way.
+
+    TO-BE (Approach):
+      - Use category-driven patterns:
+        * BW Platform  -> MERGE/joins/control tables (no SID, no buffer)
+        * UoM/Currency -> table-driven conversion + UDFs (DECIMAL-safe)
+        * Masterdata   -> joins to curated dimensions
+        * Calendar     -> Spark date functions + enterprise calendar
+        * Cleansing    -> Spark SQL expressions/UDFs
+
+    Implementation sketch:
+      1) Read inputs (ctx.current_df or ctx.read_uc(...))
+      2) Apply transforms (joins/UDFs/SQL) per rules & prompt guidance
+      3) Write/merge outputs or set ctx.current_df
+
+    Notes from prompt:
+      {textwrap.indent(prompt.strip() or "—", "      ")}
+    """
+    # TODO: replace placeholders with actual logic once input/output contracts are known
+    # Example patterns you can plug:
+    # - ctx.current_df = ctx.current_df.withColumn("AMT_LOC", fx_convert(...))
+    # - ctx.delta_merge(source_df=ctx.current_df, target_table="catalog.schema.table", keys=["k1","k2"])
+    pass
+'''
+    return template
+
+def build_doc_pack(fm: str,
+                   catalog: pd.DataFrame,
+                   edges_df: pd.DataFrame,
+                   in_deg: dict,
+                   out_deg: dict,
+                   adj: dict,
+                   depth: int,
+                   prompt: str) -> dict[str, bytes]:
+    """Create a dict of {filename: bytes} for a ZIP download."""
+    # FM metadata
+    row = catalog.loc[catalog["FM"]==fm]
+    category = row["Category"].iloc[0] if len(row)>0 else category_for_fm(fm)
+    action   = row["Action"].iloc[0]   if len(row)>0 else action_for_fm(fm)[0]
+    why      = row["Rationale"].iloc[0] if len(row)>0 else action_for_fm(fm)[1]
+    indeg    = in_deg.get(fm,0)
+    outdeg   = out_deg.get(fm,0)
+
+    # Subgraph
+    sub_nodes = bfs_nodes(adj, fm, depth=depth, direction="out")
+    sub_edges = []
+    for p, kids in adj.items():
+        if p == fm or p in sub_nodes:
+            for c in kids:
+                if c in sub_nodes or p == fm:
+                    sub_edges.append((p,c))
+    sub_mermaid = build_mermaid_subgraph(adj, fm, depth=depth)
+
+    # Nested action plan
+    nested_rows = []
+    for n in sorted(sub_nodes):
+        a, w = action_for_fm(n)
+        nested_rows.append([n, category_for_fm(n), "Y" if is_custom(n) else "N", a, w])
+    nested_df = pd.DataFrame(nested_rows, columns=["FM","Category","Is_Custom","Action","Rationale"])
+    nested_csv = nested_df.to_csv(index=False).encode("utf-8")
+
+    # MASTER doc
+    master_md = f"""# {fm} — Master Document
+
+**Category:** {category}  |  **Action:** **{action}**  |  **in_degree:** {indeg}  |  **out_degree:** {outdeg}
+
+## 1. What this FM does (AS‑IS)
+- Inferred from lineage and category mapping.
+- This FM is categorized as **{category}**; follow pattern guidance rather than 1:1 port.
+
+## 2. Lineage (focused view: depth={depth})
+{sub_mermaid}
+
+## 3. How to approach (TO‑BE)
+- **Principles**: replace BW mechanics with Lakehouse patterns; table‑driven conversion; Spark SQL/UDFs; enterprise calendar; business‑key joins (no SIDs).
+- **Selected action**: **{action}**
+- **Rationale**: {why}
+
+## 4. Converted code (skeleton)
+See `handler.py` for a runnable skeleton tailored for **{fm}** (category: **{category}**).
+Augment with real tables, joins, and UDFs based on project contracts.
+
+## 5. Handling nested FMs
+- Nested FMs (≤ {depth} hops) are summarized in **nested_action_plan.csv** (included in this ZIP).
+- **Rule of thumb**:
+  - **REBUILD**: custom Y/Z or domain‑specific logic
+  - **PATTERN**: BW platform mechanics (MERGE/joins/metadata table)
+  - **LIGHTWEIGHT**: simple SQL/UDF (lpad/date/regex)
+  - **JOIN**: masterdata readers → curated dimensions
+
+## 6. Prompt notes
+{prompt.strip() or "—"}
+"""
+
+    # LLD doc
+    lld_md = f"""# {fm} — Design LLD
+
+## Components
+- Handler: `handler.py`
+- Category: **{category}**
+- Data contracts: define input/output schemas and DECIMAL scales where money is involved
+
+## Execution
+1) Read reference tables (FX, currency_decimals, uom_factors, calendar, logsys_map) as needed
+2) Apply transformations (joins/UDFs/SQL) according to **Action={action}**
+3) MERGE/WRITE outputs or return DataFrame via context
+
+## Error Handling & Observability
+- Null/invalid checks, row counts, rejects
+- Log applied patterns and nested decisions
+
+## Open items from prompt
+{prompt.strip() or "—"}
+"""
+
+    # TEST doc
+    test_md = f"""# {fm} — How to Test
+
+## Unit tests
+- Golden cases for UoM/currency conversions (scale/rounding)
+- Cleansing (alpha/numeric checks)
+
+## Integration tests
+- Replay a short path around **{fm}** using subgraph (≤ {depth} hops)
+- Validate row counts, key uniqueness, and business rules
+"""
+
+    handler_py = make_handler_py(fm, category, prompt)
+
+    # ZIP contents
+    files = {
+        f"{fm}_MASTER.md": master_md.encode("utf-8"),
+        f"{fm}_LLD.md":    lld_md.encode("utf-8"),
+        f"{fm}_TEST.md":   test_md.encode("utf-8"),
+        "handler.py":      handler_py.encode("utf-8"),
+        "lineage.mmd":     sub_mermaid.encode("utf-8"),
+        "nested_action_plan.csv": nested_csv,
+        "ABOUT.txt": f"Generated: {datetime.now().isoformat()}\nFM: {fm}\nDepth: {depth}\n".encode("utf-8"),
+    }
+    return files
+
+def zip_bytes(files: dict[str, bytes]) -> bytes:
+    bio = io.BytesIO()
+    with ZipFile(bio, "w", ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    bio.seek(0)
+    return bio.read()
+
 # ---------------------------------------------------------------------
 # Upload: ZIP/TXT/CSV/XLSX
 # ---------------------------------------------------------------------
 uploaded = st.file_uploader(
-    "Upload ZIP (multiple FM run folders with `LINEAGE.txt`), or a single LINEAGE.txt, or your CSV/XLSX",
+    "Upload ZIP (multiple run folders with `LINEAGE.txt`), or a single LINEAGE.txt, or your CSV/XLSX",
     type=["zip","txt","csv","xlsx"],
 )
 
 if not uploaded:
-    st.info("Upload a **.zip** / **.txt** / **.csv** / **.xlsx** to view the full analysis, download the workbook, and use the prompt box.")
+    st.info("Upload a **.zip** / **.txt** / **.csv** / **.xlsx** to view the analysis, prompt, and docs.")
     st.stop()
 
 runs_edges = {}          # run_key -> list[(parent, child)]
 your_format_df = None    # retain your original table if provided
-zip_lineage_paths = []   # diagnostics (first 10 shown)
+zip_lineage_paths = []   # diagnostics
 
 if uploaded.name.lower().endswith(".zip"):
     z = ZipFile(io.BytesIO(uploaded.getvalue()))
-    lineage_members = [n for n in z.namelist() if n.upper().endswith("LINEAGE.TXT")]
+    # Be tolerant: pick any file that looks like a lineage text (endswith LINEAGE.TXT or contains LINEAGE)
+    lineage_members = [
+        n for n in z.namelist()
+        if (n.upper().endswith("LINEAGE.TXT") or ("LINEAGE" in n.upper() and n.upper().endswith(".TXT")))
+    ]
     zip_lineage_paths = lineage_members[:]
     if not lineage_members:
-        st.error("No `LINEAGE.txt` found in the ZIP.")
+        st.error("No `LINEAGE*.txt` found in the ZIP. Ensure each run folder contains one.")
         st.stop()
     for member in lineage_members:
         try:
@@ -201,11 +399,10 @@ elif uploaded.name.lower().endswith(".csv"):
     runs_edges["FROM_CSV"] = edges
 
 else:  # .xlsx
-    # Try openpyxl first; if not present, let pandas pick any available engine
     try:
         x = pd.ExcelFile(uploaded, engine="openpyxl")
     except Exception:
-        x = pd.ExcelFile(uploaded)
+        x = pd.ExcelFile(uploaded)  # let pandas choose
     if "Interdependency_Edges" in x.sheet_names:
         ed = x.parse("Interdependency_Edges")
         if {"Parent","Child"}.issubset(ed.columns):
@@ -216,32 +413,29 @@ else:  # .xlsx
     except Exception:
         your_format_df = x.parse(x.sheet_names[0])
 
-# Diagnostics for ZIP members (helps validate layout)
+# Diagnostics for ZIP members
 if zip_lineage_paths:
     st.caption(f"Found LINEAGE files in ZIP: {len(zip_lineage_paths)}")
     with st.expander("Show first 10 LINEAGE paths found"):
         st.code("\n".join(zip_lineage_paths[:10]))
 
-# Combine edges across runs
+# Combine edges across runs (de‑dupe)
 combined_edges = []
 for e in runs_edges.values():
     combined_edges.extend(e)
-# de-dupe combined
 seen, uniq = set(), []
 for e in combined_edges:
     if e not in seen:
         seen.add(e); uniq.append(e)
 combined_edges = uniq
 
-# If still no edges, stop gracefully with guidance
 if not combined_edges:
     st.error("No edges parsed from the uploaded file(s). "
-             "ZIP must contain `.../LINEAGE.txt` files with lines like `PARENT -> CHILD [ FM ]`. "
-             "For CSV, include columns `Main FM, SubFM, Level2, Level 3, Level 4`.")
+             "ZIP must contain lineage files with lines like `PARENT -> CHILD [ FM ]`, or upload your CSV with hierarchy columns.")
     st.stop()
 
 # ---------------------------------------------------------------------
-# Build all analysis tables (Your Format + rich views)
+# Build analysis tables (Your Format + rich views)
 # ---------------------------------------------------------------------
 in_deg, out_deg, nodes = degrees(combined_edges)
 
@@ -271,7 +465,7 @@ def make_your_format(df_source: pd.DataFrame | None, edges: list[tuple[str,str]]
                     df.at[i,"Remarks"] = why
         return df[cols]
     else:
-        # synthesize a simple ladder from edges (parents and first two levels of children)
+        # synthesize a simple ladder from edges
         from collections import defaultdict
         kids = defaultdict(set)
         for p,c in edges: kids[p].add(c)
@@ -368,168 +562,12 @@ matrix = pd.crosstab(edges_df["Parent"], edges_df["Child"]) if len(edges_df)>0 e
 # Prompt input (embedded into download)
 # ---------------------------------------------------------------------
 st.subheader("Give a prompt for the next step")
-default_prompt = (
-    "Generate a curated list of FMs to implement in Databricks Python. "
-    "Example: top 10 custom; depth=2; only UoM/Currency; exclude BW; generate docs."
-)
+default_prompt = ("Generate Master/LLD/Test docs and handler.py for the top 5 custom FMs by criticality. "
+                  "Limit nested analysis to depth=2 and include UoM & FX contracts.")
 user_prompt = st.text_area("Your prompt", value=default_prompt, height=120)
 
-# ---------------- Prompt parser (simple keywords) --------------------
-def parse_prompt(prompt: str):
-    p = (prompt or "").lower()
-    # number (top N)
-    import re
-    top_n = None
-    m = re.search(r"top\\s+(\\d+)", p)
-    if m:
-        top_n = int(m.group(1))
-    # depth
-    depth = 3
-    m = re.search(r"depth\\s*=\\s*(\\d+)", p)
-    if m:
-        depth = max(1, min(8, int(m.group(1))))
-    # filters
-    only_cats = set()
-    if "only uom" in p or "only currency" in p:
-        only_cats.add("UoM_Currency")
-    if "only calendar" in p or "only date" in p:
-        only_cats.add("Calendar_Time")
-    if "only bw" in p:
-        only_cats.add("BW_Platform_API")
-    if "only cleansing" in p:
-        only_cats.add("Data_Cleansing_Validation")
-    exclude_bw = "exclude bw" in p or "without bw" in p
-    only_custom = "only custom" in p
-    exclude_standard = "exclude standard" in p
-    gen_docs = ("generate docs" in p) or ("doc" in p and "generate" in p)
-    return {
-        "top_n": top_n, "depth": depth, "only_cats": only_cats,
-        "exclude_bw": exclude_bw, "only_custom": only_custom,
-        "exclude_standard": exclude_standard, "generate_docs": gen_docs
-    }
-
-# ---------------- Apply prompt processing on button click -------------
-process_col1, process_col2 = st.columns([1,3])
-with process_col1:
-    process_clicked = st.button("▶️ Process prompt")
-
-refined_tabs_placeholder = st.empty()
-download_cols_placeholder = st.empty()
-
-if process_clicked:
-    params = parse_prompt(user_prompt)
-
-    # Build a refined action plan from catalog with filters/sorting
-    refined = catalog.copy()
-
-    if params["only_custom"]:
-        refined = refined[refined["Is_Custom"]=="Y"]
-    if params["exclude_standard"]:
-        refined = refined[refined["Is_Custom"]=="Y"]
-    if params["exclude_bw"]:
-        refined = refined[refined["Category"]!="BW_Platform_API"]
-    if params["only_cats"]:
-        refined = refined[refined["Category"].isin(list(params["only_cats"]))]
-
-    # Sort by our usual priority (criticality, in/out-degree)
-    if len(refined)>0:
-        refined = refined.sort_values(["Criticality","In_Degree","Out_Degree"], ascending=False)
-
-    # Limit to top N if requested
-    if params["top_n"] and len(refined)>params["top_n"]:
-        refined = refined.head(params["top_n"])
-
-    # Compute subgraphs for each selected FM at requested depth
-    # (We won't draw all, but we’ll include recommendations and doc seeds.)
-    selected_fms = refined["FM"].tolist()
-
-    # ---- Build Recommendations.md
-    rec_buf = io.StringIO()
-    rec_buf.write(f"# Recommendations — processed prompt\n\n")
-    rec_buf.write(f"**Prompt:** {user_prompt}\\n\\n")
-    rec_buf.write(f"**Selected FMs:** {len(selected_fms)}\\n\\n")
-    if len(refined)>0:
-        rec_buf.write("## Action Plan (Top Selection)\\n\\n")
-        for _,row in refined.iterrows():
-            rec_buf.write(f"- **{row['FM']}** | Category: {row['Category']} | Action: {row['Action']} | Criticality: {row['Criticality']}\\n")
-        rec_buf.write("\\n")
-    rec_buf.write("## General Workarounds by Category\\n\\n")
-    for cat, why in POINTERS.items():
-        rec_buf.write(f"- **{cat}**: {why}\\n")
-    recommendations_md = rec_buf.getvalue()
-
-    # ---- Build Refined workbook
-    #  Your_Format stays unchanged; we include a filtered 'FM_Catalog_ActionPlan_Refined'
-    refined_sheets = {
-        "Your_Format": your_format,
-        "FM_Catalog_ActionPlan_Refined": refined if len(refined)>0 else pd.DataFrame(columns=catalog.columns),
-        "Per_Main_Summary": main_summary,
-        "Interdependency_Edges": edges_df,
-        "Interdependency_Matrix": matrix.reset_index() if len(matrix)>0 else pd.DataFrame(),
-        "Overall_Build_List": overall_build,
-        "Prompt_Box": pd.DataFrame({"Your Prompt Here:":[user_prompt]}),
-    }
-    refined_xlsx = workbook_bytes(refined_sheets)
-
-    # ---- (Optional) DocSeeds.zip for selected FMs if requested
-    doczip_bytes = b""
-    if params["generate_docs"] and len(selected_fms)>0:
-        bio_zip = io.BytesIO()
-        with zipfile.ZipFile(bio_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for fm in selected_fms:
-                act, why = action_for_fm(fm)
-                master = f"""# {fm} — Master Doc (seed)
-## AS-IS
-- in_degree={in_deg.get(fm,0)}, out_degree={out_deg.get(fm,0)}
-
-## TO-BE
-- Action: **{act}**
-- Rationale: {why}
-
-## Notes
-- Refined depth for analysis: {params['depth']}
-"""
-                zf.writestr(f"{fm}_MASTER.md", master)
-        bio_zip.seek(0)
-        doczip_bytes = bio_zip.read()
-
-    # ---- Show refined tables on screen
-    with refined_tabs_placeholder.container():
-        st.subheader("Refined results from prompt")
-        rtabs = st.tabs(["Refined Catalog", "Recommendations (MD)"])
-        with rtabs[0]:
-            st.dataframe(refined, use_container_width=True, hide_index=True)
-        with rtabs[1]:
-            st.code(recommendations_md, language="markdown")
-
-    # ---- Downloads (refined workbook + recommendations + optional doc seeds)
-    with download_cols_placeholder.container():
-        c1, c2, c3 = st.columns([2,2,1])
-        with c1:
-            st.download_button(
-                "⬇️ Download refined workbook (Excel)",
-                data=refined_xlsx,
-                file_name="SAP_FM_Analysis_Refined.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        with c2:
-            st.download_button(
-                "⬇️ Download Recommendations (MD)",
-                data=recommendations_md,
-                file_name="Recommendations.md",
-                mime="text/markdown"
-            )
-        with c3:
-            if params["generate_docs"] and len(selected_fms)>0:
-                st.download_button(
-                    "⬇️ DocSeeds.zip",
-                    data=doczip_bytes,
-                    file_name="DocSeeds.zip",
-                    mime="application/zip"
-                )
-
 # ---------------------------------------------------------------------
-# Baseline on-screen display (tabs)
+# On-screen display (tabs)
 # ---------------------------------------------------------------------
 tabs = st.tabs([
     "Your Format", "FM Catalog / Action Plan", "Per Main Summary",
@@ -555,7 +593,7 @@ with tabs[5]:
     st.dataframe(overall_build, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------
-# One-click Excel download (full baseline workbook)
+# One-click Excel download (includes Prompt_Box)
 # ---------------------------------------------------------------------
 wb_sheets = {
     "Your_Format": your_format,
@@ -576,17 +614,32 @@ st.download_button(
 )
 
 # ---------------------------------------------------------------------
-# (Optional) Quick Master doc seed for a selected FM
+# Design & Docs Generator — NEW
 # ---------------------------------------------------------------------
-st.subheader("Doc seeds for a selected FM (optional)")
-pick = st.selectbox("Choose FM", options=["<none>"] + sorted(nodes))
-if pick != "<none>":
-    act, why = action_for_fm(pick)
-    md = f"""# {pick} — Master Doc (seed)
-## AS-IS
-- in_degree={in_deg.get(pick,0)}, out_degree={out_deg.get(pick,0)}
-## TO-BE
-- Action: **{act}**
-- Rationale: {why}
-"""
-    st.download_button("Download Master.md", data=md, file_name=f"{pick}_MASTER.md", mime="text/markdown")
+st.subheader("Design & Docs Generator (per FM)")
+
+fm_pick = st.selectbox("Choose FM", options=["<none>"] + sorted(nodes))
+doc_depth = st.slider("Lineage depth for docs", min_value=1, max_value=6, value=3)
+
+st.caption("This will produce a ZIP with Master.md, LLD.md, Test.md, handler.py, lineage.mmd, and nested_action_plan.csv.")
+
+if fm_pick != "<none>":
+    files_dict = build_doc_pack(
+        fm=fm_pick,
+        catalog=catalog,
+        edges_df=edges_df,
+        in_deg=in_deg,
+        out_deg=out_deg,
+        adj=adj,
+        depth=doc_depth,
+        prompt=user_prompt
+    )
+    zbytes = zip_bytes(files_dict)
+    st.download_button(
+        "⬇️ Download Doc Pack (ZIP)",
+        data=zbytes,
+        file_name=f"{fm_pick}_Doc_Pack.zip",
+        mime="application/zip"
+    )
+else:
+    st.info("Select an FM above to enable the **Download Doc Pack (ZIP)** button.")
