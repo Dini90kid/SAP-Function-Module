@@ -1,0 +1,5 @@
+
+currency:
+  default_rounding: HALF_UP
+uom:
+  default_scale: 6
