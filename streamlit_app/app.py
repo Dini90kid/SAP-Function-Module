@@ -92,7 +92,6 @@ def parse_lineage_text(text: str):
     return uniq
 
 def edges_from_csv(df: pd.DataFrame):
-    # Expect columns like your format
     cols = {c: str(c).strip().lower().replace(" ", "_") for c in df.columns}
     df = df.rename(columns=cols)
     for need in ["main_fm","subfm","level2","level_3","level_4"]:
@@ -108,7 +107,7 @@ def edges_from_csv(df: pd.DataFrame):
     for e in edges:
         if e not in seen:
             seen.add(e); uniq.append(e)
-    return df, uniq  # return original df (for Your_Format) and edges
+    return df, uniq
 
 def degrees(edges):
     from collections import defaultdict
@@ -139,20 +138,29 @@ if not uploaded:
     st.info("Upload a **.zip** / **.txt** / **.csv** / **.xlsx** to view the full analysis, download the workbook, and use the prompt box.")
     st.stop()
 
-runs_edges = {}  # run_key -> list[(parent, child)]
-your_format_df = None
+runs_edges = {}          # run_key -> list[(parent, child)]
+your_format_df = None    # hold your original table if provided
+zip_lineage_paths = []   # diagnostics
 
 if uploaded.name.lower().endswith(".zip"):
     z = ZipFile(io.BytesIO(uploaded.getvalue()))
+    # pull ANY file that ends with LINEAGE.TXT (any nesting)
     lineage_members = [n for n in z.namelist() if n.upper().endswith("LINEAGE.TXT")]
+    zip_lineage_paths = lineage_members[:]
     if not lineage_members:
         st.error("No `LINEAGE.txt` found in the ZIP.")
         st.stop()
+    # parse all lineage files
     for member in lineage_members:
-        text = z.read(member).decode("utf-8", errors="ignore")
+        try:
+            text = z.read(member).decode("utf-8", errors="ignore")
+        except Exception:
+            text = z.read(member).decode("latin-1", errors="ignore")
         parts = [p for p in member.split("/") if p]
         run_key = parts[0] if parts else member
-        runs_edges[run_key] = parse_lineage_text(text)
+        edges = parse_lineage_text(text)
+        if edges:
+            runs_edges.setdefault(run_key, []).extend(edges)
 
 elif uploaded.name.lower().endswith(".txt"):
     text = uploaded.getvalue().decode("utf-8", errors="ignore")
@@ -160,53 +168,63 @@ elif uploaded.name.lower().endswith(".txt"):
 
 elif uploaded.name.lower().endswith(".csv"):
     df_in = pd.read_csv(uploaded)
-    your_format_df, edges = edges_from_csv(df_in)  # keep original columns
+    your_format_df, edges = edges_from_csv(df_in)
     runs_edges["FROM_CSV"] = edges
 
 else:  # .xlsx
-    # Try to read a Your_Format-like sheet first; else try edges-like sheet
     x = pd.ExcelFile(uploaded)
-    first_sheet = x.sheet_names[0]
-    df0 = x.parse(first_sheet)
-    # If workbook is the one I produced, prefer Interdependency_Edges
     if "Interdependency_Edges" in x.sheet_names:
         ed = x.parse("Interdependency_Edges")
         if {"Parent","Child"}.issubset(ed.columns):
             edges = list(zip(ed["Parent"].astype(str), ed["Child"].astype(str)))
             runs_edges["FROM_XLSX"] = edges
-    # If your original sheet is present (first sheet), we’ll also keep it
-    your_format_df = df0
+    # keep first sheet as Your_Format if present
+    try:
+        your_format_df = x.parse("Your_Format")
+    except Exception:
+        your_format_df = x.parse(x.sheet_names[0])
 
-# Combine edges for the selected view
+# diagnostics for ZIP members
+if zip_lineage_paths:
+    st.caption(f"Found LINEAGE files in ZIP: {len(zip_lineage_paths)}")
+    with st.expander("Show first 10 LINEAGE paths found"):
+        st.code("\n".join(zip_lineage_paths[:10]))
+
+# Combine edges across runs
 combined_edges = []
 for e in runs_edges.values():
     combined_edges.extend(e)
-# dedupe combined
+# de-dupe combined
 seen, uniq = set(), []
 for e in combined_edges:
     if e not in seen:
         seen.add(e); uniq.append(e)
 combined_edges = uniq
 
+# If still no edges, stop gracefully with guidance
+if not combined_edges:
+    st.error("No edges parsed from the uploaded file(s). "
+             "If you uploaded a ZIP, please ensure each run contains a `LINEAGE.txt` with lines like `PARENT -> CHILD [ FM ]`. "
+             "If you uploaded your CSV, ensure columns like `Main FM, SubFM, Level2, Level 3, Level 4` are present.")
+    st.stop()
+
 # ---------------------------------------------------------------------
-# Build analysis tables (matching your format AND adding our sheets)
+# Build analysis tables (Your Format + rich analysis)
 # ---------------------------------------------------------------------
 in_deg, out_deg, nodes = degrees(combined_edges)
 
-# 1) Your_Format (exact columns you shared). If not supplied, synthesize it.
+# 1) Your_Format
 def make_your_format(df_source: pd.DataFrame | None, edges: list[tuple[str,str]]):
     cols = ["Main FM","SubFM","Level2","Level 3","Level 4","Type","Remarks","Action Plan","Download Document"]
     if df_source is not None:
         df = df_source.copy()
-        # Ensure all columns exist
+        # ensure columns exist
         for c in cols:
-            if c not in df.columns:
-                df[c] = ""
-        # Fill Type/Action/Remarks if blank
-        for pos in ["Main FM","SubFM","Level2","Level 3","Level 4"]:
-            if pos not in df.columns: df[pos] = ""
+            if c not in df.columns: df[c] = ""
+        # back-fill Type/Action/Remarks
+        order = ["Level 4","Level 3","Level2","SubFM","Main FM"]
         def best_name(row):
-            for pos in ["Level 4","Level 3","Level2","SubFM","Main FM"]:
+            for pos in order:
                 val = row.get(pos, "")
                 if isinstance(val, str) and val.strip(): return val.strip()
             return ""
@@ -218,20 +236,18 @@ def make_your_format(df_source: pd.DataFrame | None, edges: list[tuple[str,str]]
                     df.at[i,"Type"] = "Custom" if is_custom(name) else "Standard"
                 if not str(df.at[i,"Action Plan"]).strip():
                     df.at[i,"Action Plan"] = act
-                # Only add Remarks if empty (don’t override your notes)
                 if not str(df.at[i,"Remarks"]).strip():
                     df.at[i,"Remarks"] = why
         return df[cols]
     else:
-        # Build a simple ladder from edges (Main FM in first column, then children)
-        # We’ll populate rows for each parent and its first two levels of children.
+        # synthesize one from edges (2-level ladder per parent)
         from collections import defaultdict
         kids = defaultdict(set)
         for p,c in edges: kids[p].add(c)
         rows = []
         for p in sorted(kids.keys()):
             for c in sorted(kids[p]):
-                # try to find grandkids
+                # try grandchildren
                 gks = sorted(kids.get(c, []))
                 if gks:
                     for g in gks:
@@ -246,21 +262,25 @@ def make_your_format(df_source: pd.DataFrame | None, edges: list[tuple[str,str]]
 
 your_format = make_your_format(your_format_df, combined_edges)
 
-# 2) FM_Catalog_ActionPlan
+# 2) FM_Catalog_ActionPlan (guard for empty)
 cat_rows = []
 for fm in sorted(nodes):
-    action, why = action_for_fm(fm)
+    act, why = action_for_fm(fm)
     cat_rows.append({
         "FM": fm,
         "Category": category_for_fm(fm),
         "Is_Custom": "Y" if is_custom(fm) else "N",
-        "Action": action,
+        "Action": act,
         "Rationale": why,
         "In_Degree": in_deg.get(fm,0),
         "Out_Degree": out_deg.get(fm,0),
         "Criticality": in_deg.get(fm,0)*2 + out_deg.get(fm,0) + (1 if is_custom(fm) else 0),
     })
-catalog = pd.DataFrame(cat_rows).sort_values(["Criticality","In_Degree","Out_Degree"], ascending=False)
+
+catalog_cols = ["FM","Category","Is_Custom","Action","Rationale","In_Degree","Out_Degree","Criticality"]
+catalog = pd.DataFrame(cat_rows, columns=catalog_cols)
+if len(catalog) > 0:
+    catalog = catalog.sort_values(["Criticality","In_Degree","Out_Degree"], ascending=False)
 
 # 3) Interdependency_Edges
 edges_df = pd.DataFrame(combined_edges, columns=["Parent","Child"])
@@ -268,17 +288,16 @@ edges_df["Parent_Category"] = edges_df["Parent"].apply(category_for_fm)
 edges_df["Child_Category"]  = edges_df["Child"].apply(category_for_fm)
 edges_df["Child_Is_Custom"] = edges_df["Child"].apply(lambda x: "Y" if is_custom(x) else "N")
 
-# 4) Per_Main_Summary (from "Main FM" in your format if supplied)
-mains = []
+# 4) Per_Main_Summary (from Your_Format if present)
 if your_format_df is not None and "Main FM" in your_format_df.columns:
     mains = [m for m in your_format_df["Main FM"].dropna().unique().tolist() if isinstance(m, str) and m.strip()]
 else:
-    # fallback: treat every node that has outgoing edges as a 'main'
     mains = sorted(set(p for p,_ in combined_edges))
 
 from collections import defaultdict
 adj = defaultdict(set)
 for p,c in combined_edges: adj[p].add(c)
+
 summary_rows = []
 for main in mains:
     direct = sorted(adj.get(main, []))
@@ -306,14 +325,16 @@ for main in mains:
 main_summary = pd.DataFrame(summary_rows)
 
 # 5) Overall_Build_List
-overall_build = catalog.loc[catalog["Is_Custom"]=="Y", ["FM","Category","Action","Criticality"]] \
-                       .sort_values(["Action","Criticality"], ascending=[True, False])
+overall_build = catalog.loc[catalog.get("Is_Custom","N")=="Y", ["FM","Category","Action","Criticality"]] \
+                       if len(catalog)>0 else pd.DataFrame(columns=["FM","Category","Action","Criticality"])
+if len(overall_build)>0:
+    overall_build = overall_build.sort_values(["Action","Criticality"], ascending=[True, False])
 
 # 6) Interdependency_Matrix
-matrix = pd.crosstab(edges_df["Parent"], edges_df["Child"])
+matrix = pd.crosstab(edges_df["Parent"], edges_df["Child"]) if len(edges_df)>0 else pd.DataFrame()
 
 # ---------------------------------------------------------------------
-# Prompt input (will be embedded into the workbook)
+# Prompt input (embedded in workbook)
 # ---------------------------------------------------------------------
 st.subheader("Give a prompt for the next step")
 default_prompt = ("Generate Master/LLD/Test docs and handler.py for the top 5 custom FMs by criticality. "
@@ -321,7 +342,7 @@ default_prompt = ("Generate Master/LLD/Test docs and handler.py for the top 5 cu
 user_prompt = st.text_area("Your prompt", value=default_prompt, height=120)
 
 # ---------------------------------------------------------------------
-# Show everything on screen (tabs) and provide a one-click Excel download
+# Show everything (tabs) and provide Excel download
 # ---------------------------------------------------------------------
 tabs = st.tabs([
     "Your Format", "FM Catalog / Action Plan", "Per Main Summary",
@@ -346,17 +367,24 @@ with tabs[4]:
 with tabs[5]:
     st.dataframe(overall_build, use_container_width=True, hide_index=True)
 
-# Compose workbook in memory (adds a Prompt_Box sheet)
-workbook_sheets = {
+# Compose workbook bytes (includes Prompt_Box)
+wb_sheets = {
     "Your_Format": your_format,
     "FM_Catalog_ActionPlan": catalog,
     "Per_Main_Summary": main_summary,
     "Interdependency_Edges": edges_df,
-    "Interdependency_Matrix": matrix.reset_index(),
+    "Interdependency_Matrix": matrix.reset_index() if len(matrix)>0 else pd.DataFrame(),
     "Overall_Build_List": overall_build,
     "Prompt_Box": pd.DataFrame({"Your Prompt Here:":[user_prompt]}),
 }
-wb_bytes = workbook_bytes(workbook_sheets)
+wb_bytes = (lambda sheets: (io.BytesIO() if True else None))  # placeholder for closure
+def _wb_bytes(sheets):
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        for name, df in sheets.items():
+            df.to_excel(xw, sheet_name=name[:31], index=False)
+    bio.seek(0); return bio.read()
+wb_bytes = _wb_bytes(wb_sheets)
 
 st.download_button(
     "⬇️ Download analysis workbook (Excel)",
@@ -365,11 +393,10 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# (Optional) Quick doc-seed generator for a selected FM
+# Optional: Doc-seed generator for a selected FM
 st.subheader("Doc seeds for a selected FM (optional)")
 pick = st.selectbox("Choose FM", options=["<none>"] + sorted(nodes))
 if pick != "<none>":
-    # Very small, helpful seed
     act, why = action_for_fm(pick)
     md = f"""# {pick} — Master Doc (seed)
 ## AS-IS
